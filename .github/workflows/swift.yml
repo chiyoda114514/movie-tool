@@ -1,0 +1,55 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare Project Files
+        run: |
+          mkdir -p Sources
+          if [ -f VideoPlayerApp.swift ]; then
+            mv VideoPlayerApp.swift Sources/VideoPlayerApp.swift
+          fi
+          sed -i '' 's/@retroactive //g' Sources/VideoPlayerApp.swift || true
+          if ! grep -q "SWIFT_VERSION" project.yml; then
+            echo '        SWIFT_VERSION: "5.0"' >> project.yml
+          fi
+
+      - name: Install XcodeGen
+        run: which xcodegen || brew install xcodegen
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Build Unsigned iOS App
+        run: |
+          xcodebuild clean build \
+            -project SpeedFramePlayer.xcodeproj \
+            -scheme SpeedFramePlayer \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: Package into .ipa
+        run: |
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/SpeedFramePlayer.app Payload/
+          zip -r SpeedFramePlayer.ipa Payload
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SpeedFramePlayer-IPA
+          path: SpeedFramePlayer.ipa
