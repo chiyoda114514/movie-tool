@@ -3,6 +3,8 @@ import AVKit
 import AVFoundation
 import Photos
 import PhotosUI
+import CoreTransferable
+import UniformTypeIdentifiers
 import Combine
 
 // MARK: - App Entry Point
@@ -16,6 +18,26 @@ struct SpeedFramePlayerApp: App {
     }
 }
 
+// MARK: - Movie Transferable (PhotosPickerで権限ダイアログなしでも動画を読み込める仕組み)
+struct PickedMovie: Transferable {
+    let url: URL
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(contentType: .movie) { movie in
+            SentTransferredFile(movie.url)
+        } importing: { received in
+            let tempDir = FileManager.default.temporaryDirectory
+            let fileName = "picked_\(UUID().uuidString).\(received.file.pathExtension.isEmpty ? "mov" : received.file.pathExtension)"
+            let copyURL = tempDir.appendingPathComponent(fileName)
+            if FileManager.default.fileExists(atPath: copyURL.path) {
+                try? FileManager.default.removeItem(at: copyURL)
+            }
+            try FileManager.default.copyItem(at: received.file, to: copyURL)
+            return Self(url: copyURL)
+        }
+    }
+}
+
 // MARK: - 1. Photo Library Sync Manager (写真アプリとのリアルタイム同期)
 @MainActor
 final class PhotoLibrarySyncManager: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
@@ -24,29 +46,53 @@ final class PhotoLibrarySyncManager: NSObject, ObservableObject, PHPhotoLibraryC
     @Published var isLoading: Bool = false
 
     private var fetchResult: PHFetchResult<PHAsset>?
+    private var isObserverRegistered: Bool = false
 
     override init() {
         super.init()
-        authorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
-        PHPhotoLibrary.shared().register(self)
-        if authorizationStatus == .authorized || authorizationStatus == .limited {
+        let currentStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        self.authorizationStatus = currentStatus
+        // 重要: 権限が未決定(.notDetermined)の段階で PHPhotoLibrary.shared() を呼ぶと
+        // iOSの権限ダイアログがフリーズするため、許可済みのときだけ登録する
+        if currentStatus == .authorized || currentStatus == .limited {
+            registerObserverIfNeeded()
             fetchVideos()
         }
     }
 
     deinit {
-        PHPhotoLibrary.shared().unregisterChangeObserver(self)
+        if isObserverRegistered {
+            PHPhotoLibrary.shared().unregisterChangeObserver(self)
+        }
+    }
+
+    private func registerObserverIfNeeded() {
+        guard !isObserverRegistered else { return }
+        PHPhotoLibrary.shared().register(self)
+        isObserverRegistered = true
     }
 
     func requestPermissionAndFetch() {
-        PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] status in
-            Task { @MainActor in
-                guard let self = self else { return }
-                self.authorizationStatus = status
-                if status == .authorized || status == .limited {
-                    self.fetchVideos()
+        Task { @MainActor in
+            let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+            self.authorizationStatus = status
+            if status == .authorized || status == .limited {
+                self.registerObserverIfNeeded()
+                self.fetchVideos()
+            } else if status == .denied || status == .restricted {
+                if let url = URL(string: UIApplication.openSettingsURLString) {
+                    await UIApplication.shared.open(url)
                 }
             }
+        }
+    }
+
+    func refreshStatus() {
+        let currentStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        self.authorizationStatus = currentStatus
+        if currentStatus == .authorized || currentStatus == .limited {
+            registerObserverIfNeeded()
+            fetchVideos()
         }
     }
 
@@ -100,7 +146,6 @@ final class VideoPlayerViewModel: ObservableObject {
     let speedPresets: [Float] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
 
     private var timeObserver: Any?
-    private var statusCancellable: AnyCancellable?
     private var endObserver: NSObjectProtocol?
     private var wasPlayingBeforeLongPress: Bool = false
     private let hapticGenerator = UIImpactFeedbackGenerator(style: .medium)
@@ -141,7 +186,7 @@ final class VideoPlayerViewModel: ObservableObject {
         options.isNetworkAccessAllowed = true
         options.deliveryMode = .highQualityFormat
 
-        PHImageManager.default().requestAVAsset(forVideo: phAsset, options: options) { [weak self] avAsset, _, info in
+        PHImageManager.default().requestAVAsset(forVideo: phAsset, options: options) { [weak self] avAsset, _, _ in
             Task { @MainActor in
                 guard let self = self else { return }
                 if let avAsset = avAsset {
@@ -200,7 +245,6 @@ final class VideoPlayerViewModel: ObservableObject {
     }
 
     func play() {
-        // 終端に達していたら先頭に戻す
         if currentTime >= duration - 0.05 {
             seek(to: 0)
         }
@@ -224,18 +268,15 @@ final class VideoPlayerViewModel: ObservableObject {
 
     // MARK: コマ送り / コマ戻し（1フレーム単位）
     func stepFrames(count: Int) {
-        // コマ送り時は必ず一時停止状態にする
         if isPlaying {
             pause()
         }
         guard let item = player.currentItem else { return }
 
-        // AVPlayerItem標準のフレームステップが利用可能な場合は優先使用
         if (count > 0 && item.canStepForward) || (count < 0 && item.canStepBackward) {
             item.step(byCount: count)
             currentTime = CMTimeGetSeconds(player.currentTime())
         } else {
-            // フォールバック: フレームレートから1コマの秒数を計算して正確にシーク
             let frameDuration = 1.0 / Double(max(nominalFPS, 1.0))
             let targetTime = min(max(currentTime + Double(count) * frameDuration, 0.0), duration)
             seek(to: targetTime)
@@ -330,11 +371,22 @@ struct VideoSurfaceView: UIViewRepresentable {
     }
 }
 
-// MARK: - 4. Video Library Grid View (写真アプリ同期一覧画面)
+// MARK: - 再生対象の識別用モデル
+struct PlayableVideoTarget: Identifiable {
+    let id = UUID()
+    let phAsset: PHAsset?
+    let fileURL: URL?
+}
+
+// MARK: - 4. Video Library Grid View (写真アプリ同期一覧画面 ＋ 直接ピッカー)
 struct VideoLibraryView: View {
     @StateObject private var libraryManager = PhotoLibrarySyncManager()
-    @State private var selectedAsset: PHAsset?
-    @State private var columns = [
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var activeVideoTarget: PlayableVideoTarget?
+    @State private var selectedPickerItem: PhotosPickerItem?
+    @State private var isImportingPickerVideo: Bool = false
+
+    private let columns = [
         GridItem(.flexible(), spacing: 4),
         GridItem(.flexible(), spacing: 4),
         GridItem(.flexible(), spacing: 4)
@@ -342,101 +394,152 @@ struct VideoLibraryView: View {
 
     var body: some View {
         NavigationStack {
-            Group {
-                switch libraryManager.authorizationStatus {
-                case .notDetermined:
-                    permissionPromptView(
-                        title: "写真アプリと同期",
-                        message: "iPhoneの「写真」アプリ内の動画を自動で読み込み、倍速・スロー・コマ送り再生を行います。",
-                        buttonTitle: "写真へのアクセスを許可"
-                    ) {
-                        libraryManager.requestPermissionAndFetch()
-                    }
-                case .denied, .restricted:
-                    permissionPromptView(
-                        title: "アクセス権限が必要です",
-                        message: "「設定」アプリ > プライバシーとセキュリティ > 写真 から、このアプリのアクセスを許可してください。",
-                        buttonTitle: "設定アプリを開く"
-                    ) {
-                        if let url = URL(string: UIApplication.openSettingsURLString) {
-                            UIApplication.shared.open(url)
+            ZStack {
+                Group {
+                    switch libraryManager.authorizationStatus {
+                    case .notDetermined, .denied, .restricted:
+                        VStack(spacing: 22) {
+                            Image(systemName: "photo.on.rectangle.angled")
+                                .font(.system(size: 56))
+                                .foregroundStyle(.yellow)
+
+                            Text("写真アプリの動画を再生")
+                                .font(.title2.bold())
+
+                            Text("下の「写真アプリから動画を選択」を押すと、権限設定なしですぐに動画を選んで再生できます。\nすべての動画を一覧表示したい場合は「全動画の自動同期を許可」を押してください。")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                                .padding(.horizontal, 28)
+
+                            // 方法1: 権限ダイアログ不要で確実に動くiOS標準ピッカー
+                            PhotosPicker(
+                                selection: $selectedPickerItem,
+                                matching: .videos,
+                                photoLibrary: .shared()
+                            ) {
+                                Label("写真アプリから動画を選択（すぐ再生）", systemImage: "play.rectangle.fill")
+                                    .font(.headline)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 14)
+                                    .background(.yellow, in: Capsule())
+                                    .foregroundStyle(.black)
+                            }
+                            .padding(.horizontal, 32)
+
+                            // 方法2: 写真ライブラリ全件の自動同期
+                            Button {
+                                libraryManager.requestPermissionAndFetch()
+                            } label: {
+                                Label(
+                                    libraryManager.authorizationStatus == .notDetermined
+                                        ? "全動画の自動同期を許可する"
+                                        : "設定アプリで写真アクセスを許可する",
+                                    systemImage: "arrow.triangle.2.circlepath"
+                                )
+                                .font(.subheadline.bold())
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                                .background(.white.opacity(0.15), in: Capsule())
+                                .foregroundStyle(.white)
+                            }
+                            .padding(.horizontal, 32)
                         }
-                    }
-                case .authorized, .limited:
-                    if libraryManager.isLoading {
-                        ProgressView("写真アプリの動画を同期中...")
-                    } else if libraryManager.videoAssets.isEmpty {
-                        ContentUnavailableView(
-                            "動画がありません",
-                            systemImage: "video.slash",
-                            description: Text("写真アプリに動画を保存すると、ここに自動で同期されます。")
-                        )
-                    } else {
-                        ScrollView {
-                            LazyVGrid(columns: columns, spacing: 4) {
-                                ForEach(libraryManager.videoAssets, id: \.localIdentifier) { asset in
-                                    Button {
-                                        selectedAsset = asset
-                                    } label: {
-                                        VideoThumbnailCell(asset: asset)
-                                    }
-                                    .buttonStyle(.plain)
+
+                    case .authorized, .limited:
+                        if libraryManager.isLoading {
+                            ProgressView("写真アプリの動画を同期中...")
+                        } else if libraryManager.videoAssets.isEmpty {
+                            VStack(spacing: 16) {
+                                ContentUnavailableView(
+                                    "表示できる動画がありません",
+                                    systemImage: "video.slash",
+                                    description: Text("写真アプリから動画を選択するか、フルアクセスを許可してください。")
+                                )
+                                PhotosPicker(
+                                    selection: $selectedPickerItem,
+                                    matching: .videos,
+                                    photoLibrary: .shared()
+                                ) {
+                                    Label("写真アプリから動画を選択", systemImage: "plus.circle.fill")
+                                        .font(.headline)
+                                        .padding(.horizontal, 24)
+                                        .padding(.vertical, 12)
+                                        .background(.yellow, in: Capsule())
+                                        .foregroundStyle(.black)
                                 }
                             }
-                            .padding(4)
+                        } else {
+                            ScrollView {
+                                LazyVGrid(columns: columns, spacing: 4) {
+                                    ForEach(libraryManager.videoAssets, id: \.localIdentifier) { asset in
+                                        Button {
+                                            activeVideoTarget = PlayableVideoTarget(phAsset: asset, fileURL: nil)
+                                        } label: {
+                                            VideoThumbnailCell(asset: asset)
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                                .padding(4)
+                            }
                         }
+                    @unknown default:
+                        EmptyView()
                     }
-                @unknown default:
-                    EmptyView()
+                }
+
+                if isImportingPickerVideo {
+                    Color.black.opacity(0.45).ignoresSafeArea()
+                    ProgressView("動画を読み込み中...")
+                        .padding(20)
+                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
                 }
             }
             .navigationTitle("動画ライブラリ")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    PhotosPicker(
+                        selection: $selectedPickerItem,
+                        matching: .videos,
+                        photoLibrary: .shared()
+                    ) {
+                        Label("動画を選択", systemImage: "plus.rectangle.on.folder.fill")
+                            .font(.subheadline.bold())
+                            .foregroundStyle(.yellow)
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
-                        libraryManager.fetchVideos()
+                        libraryManager.refreshStatus()
                     } label: {
                         Image(systemName: "arrow.triangle.2.circlepath")
                     }
                 }
             }
-            .fullScreenCover(item: $selectedAsset) { asset in
-                CustomVideoPlayerScreen(phAsset: asset)
+            .onChange(of: scenePhase) { _, newPhase in
+                if newPhase == .active {
+                    libraryManager.refreshStatus()
+                }
+            }
+            .onChange(of: selectedPickerItem) { _, newItem in
+                guard let newItem = newItem else { return }
+                isImportingPickerVideo = true
+                Task { @MainActor in
+                    defer {
+                        isImportingPickerVideo = false
+                        selectedPickerItem = nil
+                    }
+                    if let picked = try? await newItem.loadTransferable(type: PickedMovie.self) {
+                        activeVideoTarget = PlayableVideoTarget(phAsset: nil, fileURL: picked.url)
+                    }
+                }
+            }
+            .fullScreenCover(item: $activeVideoTarget) { target in
+                CustomVideoPlayerScreen(target: target)
             }
         }
     }
-
-    private func permissionPromptView(
-        title: String,
-        message: String,
-        buttonTitle: String,
-        action: @escaping () -> Void
-    ) -> some View {
-        VStack(spacing: 20) {
-            Image(systemName: "photo.on.rectangle.angled")
-                .font(.system(size: 56))
-                .foregroundStyle(.blue)
-            Text(title)
-                .font(.title2.bold())
-            Text(message)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
-            Button(action: action) {
-                Text(buttonTitle)
-                    .font(.headline)
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 12)
-                    .background(.blue, in: Capsule())
-                    .foregroundStyle(.white)
-            }
-        }
-    }
-}
-
-extension PHAsset: @retroactive Identifiable {
-    public var id: String { localIdentifier }
 }
 
 // MARK: - Thumbnail Cell (動画サムネイル＆再生時間表示)
@@ -501,7 +604,7 @@ struct VideoThumbnailCell: View {
 
 // MARK: - 5. Custom Video Player Screen (メイン再生画面)
 struct CustomVideoPlayerScreen: View {
-    let phAsset: PHAsset
+    let target: PlayableVideoTarget
     @Environment(\.dismiss) private var dismiss
     @StateObject private var viewModel = VideoPlayerViewModel()
     @State private var showControls: Bool = true
@@ -763,14 +866,17 @@ struct CustomVideoPlayerScreen: View {
             }
         }
         .onAppear {
-            viewModel.load(phAsset: phAsset)
+            if let asset = target.phAsset {
+                viewModel.load(phAsset: asset)
+            } else if let url = target.fileURL {
+                viewModel.load(url: url)
+            }
         }
         .onDisappear {
             viewModel.cleanup()
         }
     }
 
-    // 00:12.34 のようにミリ秒まで表示
     private func formatPreciseTime(_ seconds: Double) -> String {
         guard seconds.isFinite && seconds >= 0 else { return "00:00.00" }
         let mins = Int(seconds) / 60
