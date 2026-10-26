@@ -7,7 +7,8 @@ targets:
   SpeedFramePlayer:
     type: application
     platform: iOS
-    sources: [Sources]
+    sources:
+      - path: Sources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.speedframe.player
