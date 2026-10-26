@@ -46,6 +46,7 @@ jobs:
         run: |
           mkdir -p Payload
           cp -r build/Build/Products/Release-iphoneos/SpeedFramePlayer.app Payload/
+          plutil -replace NSPhotoLibraryUsageDescription -string "動画を再生するために写真ライブラリへアクセスします" Payload/SpeedFramePlayer.app/Info.plist
           zip -r SpeedFramePlayer.ipa Payload
 
       - name: Upload IPA Artifact
