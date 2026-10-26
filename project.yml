@@ -19,6 +19,5 @@ targets:
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
-    info:
-      properties:
-        NSPhotoLibraryUsageDescription: "写真アプリ内の動画を同期して倍速・スロー・コマ送り再生するためにアクセスします。"
+        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "写真アプリ内の動画を同期して倍速・スロー・コマ送り再生するためにアクセスします。"
+        
