@@ -46,7 +46,18 @@ jobs:
         run: |
           mkdir -p Payload
           cp -r build/Build/Products/Release-iphoneos/SpeedFramePlayer.app Payload/
-          plutil -replace NSPhotoLibraryUsageDescription -string "動画を再生するために写真ライブラリへアクセスします" Payload/SpeedFramePlayer.app/Info.plist
+          
+          # 正しいInfo.plistの場所を確認して書き込む
+          PLIST_PATH="Payload/SpeedFramePlayer.app/Info.plist"
+          if [ -f "$PLIST_PATH" ]; then
+            echo "Found Info.plist at $PLIST_PATH"
+            plutil -replace NSPhotoLibraryUsageDescription -string "動画を再生するために写真ライブラリへアクセスします" "$PLIST_PATH"
+            echo "Successfully injected NSPhotoLibraryUsageDescription"
+          else
+            echo "Error: Info.plist not found at $PLIST_PATH"
+            exit 1
+          fi
+          
           zip -r SpeedFramePlayer.ipa Payload
 
       - name: Upload IPA Artifact
